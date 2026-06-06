@@ -316,6 +316,135 @@ impl WatchBackend for FakeBackend {
     }
 }
 
+// ─── TrackingFakeBackend ──────────────────────────────────────────────────────
+
+/// Test-only [`WatchBackend`] that records every `watch` and `reseed_cursor`
+/// call so assertions can verify call counts and argument order.
+///
+/// After a `watch(path)` call, `path` is appended to `self.live` (simulating
+/// the root becoming watched) so a second plan pass sees it as `NoOp`.
+pub struct TrackingFakeBackend {
+    /// Current live roots snapshot, updated by `watch` calls.
+    pub live: std::cell::RefCell<Vec<WatchState>>,
+    /// Paths that `watch` was called with, in call order.
+    pub watched_calls: std::cell::RefCell<Vec<PathBuf>>,
+    /// Paths that `reseed_cursor` was called with, in call order.
+    pub reseeded_calls: std::cell::RefCell<Vec<PathBuf>>,
+    /// If set, `watch` returns an error for this path (simulates failure).
+    pub fail_watch_path: Option<PathBuf>,
+}
+
+impl TrackingFakeBackend {
+    /// Construct a new `TrackingFakeBackend` with the given initial live roots.
+    #[must_use]
+    pub const fn new(live: Vec<WatchState>) -> Self {
+        Self {
+            live: std::cell::RefCell::new(live),
+            watched_calls: std::cell::RefCell::new(Vec::new()),
+            reseeded_calls: std::cell::RefCell::new(Vec::new()),
+            fail_watch_path: None,
+        }
+    }
+}
+
+impl WatchBackend for TrackingFakeBackend {
+    fn live_roots(&self) -> Result<Vec<WatchState>> {
+        Ok(self.live.borrow().clone())
+    }
+
+    fn watch(&self, path: &Path) -> Result<()> {
+        if self.fail_watch_path.as_deref() == Some(path) {
+            return Err(Error::Watchman(format!(
+                "simulated watch failure: {}",
+                path.display()
+            )));
+        }
+        self.watched_calls.borrow_mut().push(path.to_path_buf());
+        // Simulate the root becoming present.
+        self.live.borrow_mut().push(WatchState {
+            path: path.to_path_buf(),
+            clock: None,
+            present: true,
+        });
+        Ok(())
+    }
+
+    fn reseed_cursor(&self, path: &Path) -> Result<()> {
+        self.reseeded_calls.borrow_mut().push(path.to_path_buf());
+        // Simulate the cursor being refreshed: clear any stale clock.
+        let mut live = self.live.borrow_mut();
+        for state in live.iter_mut() {
+            if state.path == path {
+                state.clock = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ─── Apply ────────────────────────────────────────────────────────────────────
+
+/// The result of executing a reconcile plan via [`apply`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyReport {
+    /// All actions that were attempted (excludes `NoOp` and `NoteUndeclared`).
+    pub attempted: Vec<ReconcileAction>,
+    /// Actions that completed without error.
+    pub succeeded: Vec<ReconcileAction>,
+    /// Actions that failed, paired with the error message.
+    pub failed: Vec<(ReconcileAction, String)>,
+}
+
+impl ApplyReport {
+    /// Returns `true` if all attempted actions succeeded and `failed` is empty.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+/// Execute a [`ReconcilePlan`] against `backend`.
+///
+/// Only `Watch` and `ReseedCursor` actions are executed; `NoOp` and
+/// `NoteUndeclared` are silently skipped.  A per-action failure is recorded in
+/// [`ApplyReport::failed`] and does **not** abort subsequent actions.
+///
+/// # Guarantees
+///
+/// - Never removes a root from the backend.
+/// - `NoteUndeclared` roots are never passed to `watch` or `reseed_cursor`.
+/// - Safe to call repeatedly: calling it twice is a no-op on the second pass
+///   because a subsequent `reconcile` will see all `Missing` roots as `NoOp`
+///   after the first successful apply.
+pub fn apply(plan: &ReconcilePlan, backend: &dyn WatchBackend) -> ApplyReport {
+    let mut attempted = Vec::new();
+    let mut succeeded = Vec::new();
+    let mut failed: Vec<(ReconcileAction, String)> = Vec::new();
+
+    for entry in &plan.actions {
+        match &entry.action {
+            ReconcileAction::Watch { path } => {
+                attempted.push(entry.action.clone());
+                match backend.watch(path) {
+                    Ok(()) => succeeded.push(entry.action.clone()),
+                    Err(e) => failed.push((entry.action.clone(), e.to_string())),
+                }
+            }
+            ReconcileAction::ReseedCursor { path } => {
+                attempted.push(entry.action.clone());
+                match backend.reseed_cursor(path) {
+                    Ok(()) => succeeded.push(entry.action.clone()),
+                    Err(e) => failed.push((entry.action.clone(), e.to_string())),
+                }
+            }
+            // NoOp and NoteUndeclared are intentionally skipped — no removal.
+            ReconcileAction::NoOp { .. } | ReconcileAction::NoteUndeclared { .. } => {}
+        }
+    }
+
+    ApplyReport { attempted, succeeded, failed }
+}
+
 // ─── Pure reconcile ───────────────────────────────────────────────────────────
 
 /// Extract the Unix timestamp embedded in a watchman clock string.
