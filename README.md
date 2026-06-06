@@ -163,6 +163,61 @@ pub fn reconcile(
 
 ---
 
+## anchor-boot: lifecycle wiring
+
+`anchor-boot` ships the `boot/` directory that wires `anchor reconcile --apply`
+into the laptop's lifecycle so watch roots are restored automatically on every
+reboot and every new Claude session — without any manual re-watch step.
+
+### Coverage split
+
+| Loss window | Mechanism |
+|---|---|
+| Reboot / watchman restart | `anchor-reconcile.service` — Type=oneshot, ordered After=watchman.service |
+| New Claude session (mid-session loss) | `anchor-session-start.sh` SessionStart hook |
+
+### Install
+
+```bash
+# From the anchor repo root:
+bash boot/install.sh
+```
+
+`install.sh` is idempotent: running it twice leaves exactly one unit symlink and
+exits 0. It:
+
+1. Symlinks `boot/anchor-reconcile.service` into `~/.config/systemd/user/`
+2. Runs `systemctl --user daemon-reload && enable`
+3. **Prints** the `settings.json` SessionStart hook entry to add (it does NOT
+   modify `~/.claude/settings.json` unprompted — that edit is user-gated)
+
+### Back out
+
+```bash
+systemctl --user disable --now anchor-reconcile.service
+rm ~/.config/systemd/user/anchor-reconcile.service
+# Remove the SessionStart hook line from ~/.claude/settings.json by hand.
+```
+
+### Optional periodic timer
+
+`boot/anchor-reconcile.timer` is provided but **not enabled by default**
+(the oneshot + SessionStart hook already cover both observed loss windows).
+Enable with:
+
+```bash
+systemctl --user enable --now anchor-reconcile.timer
+```
+
+### Session-start hook behaviour
+
+`boot/anchor-session-start.sh` follows the low-noise posture of the existing
+hooks: it prints a one-line summary **only if a root was re-asserted**. A
+healthy session stays silent. It always exits 0 — a watch failure must never
+block a session from starting.
+
+---
+
 ## SIGPIPE
 
 `main()` calls `sigpipe::reset()` as its first statement, so `anchor plan | head` never panics.

@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodic anchor reconcile (optional — NOT enabled by default)
+Documentation=https://github.com/j0yen/anchor
+After=watchman.service
+
+[Timer]
+# Run 2 minutes after session start, then every 30 minutes.
+# This is an OPT-IN companion to anchor-reconcile.service; the oneshot unit
+# and SessionStart hook already cover the two primary loss windows (boot +
+# session open). Enable with:
+#   systemctl --user enable --now anchor-reconcile.timer
+OnStartupSec=2min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target

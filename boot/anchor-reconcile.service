@@ -1,0 +1,16 @@
+[Unit]
+Description=Re-assert watchman watch roots declared in the anchor manifest
+Documentation=https://github.com/j0yen/anchor
+After=watchman.service
+Wants=watchman.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/anchor reconcile --apply
+StandardOutput=journal
+StandardError=journal
+# Never block login: a failure is logged but does not abort the session target.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=default.target
