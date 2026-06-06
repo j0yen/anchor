@@ -1,0 +1,28 @@
+# anchor — example roots manifest.
+# Copy to ~/.config/anchor/roots.toml and adjust paths.
+#
+# Each [[root]] entry declares one watchman root that should always be live.
+# max_age_secs is optional; if set, a watchman clock older than this many seconds
+# is classified as "stale" (requiring a cursor reseed).
+
+[[root]]
+path = "/home/jsy/.claude"
+max_age_secs = 86400      # 24 hours; self-review writes here daily
+
+[[root]]
+path = "/home/jsy/brain"
+max_age_secs = 86400
+
+[[root]]
+path = "/home/jsy/wintermute"
+max_age_secs = 604800     # 7 days; large tree, less active
+
+[[root]]
+path = "/home/jsy/.local/bin"
+# No max_age_secs: staleness not checked for the toolkit dir.
+
+[[root]]
+path = "/home/jsy/.config/systemd/user"
+
+[[root]]
+path = "/home/jsy/.cache/ctrace/sessions"

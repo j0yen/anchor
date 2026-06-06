@@ -1,0 +1,178 @@
+# anchor
+
+**Declared watch-root manifest and pure reconcile plan for watchman root management.**
+
+`anchor` solves a recurring problem on a watchman-backed laptop: every reboot
+(or socket bounce) silently drops all watched roots, leaving `wchg` returning
+empty deltas with no diagnostic. There is no canonical record of which roots
+*should* be watched, and no tool that diffs declared-vs-live.
+
+`anchor` is the base crate that creates that record and the shared types. The
+rest of the anchor fleet extends it:
+
+| PRD | What it adds |
+|---|---|
+| `anchor-probe` | real-time cursor-age probing via watchman clock |
+| `anchor-reconcile` | `--apply` mode that calls `watchman watch` / reseeds cursors |
+| `anchor-boot` | systemd service that re-watches roots on every reboot |
+
+---
+
+## Quick start
+
+```
+# Install
+cargo install --path .
+
+# Create your manifest
+mkdir -p ~/.config/anchor
+cp config/roots.example.toml ~/.config/anchor/roots.toml
+$EDITOR ~/.config/anchor/roots.toml
+
+# Show the reconcile plan
+anchor plan
+anchor plan --format json
+```
+
+`anchor plan` exits **non-zero** if any declared root is `Missing` — safe to
+use as a pre-command gate.
+
+---
+
+## Manifest format (`roots.toml`)
+
+```toml
+# Each [[root]] entry declares one watchman root that should always be live.
+
+[[root]]
+path = "/home/jsy/.claude"
+max_age_secs = 86400      # optional: clock older than this → "stale"
+
+[[root]]
+path = "/home/jsy/brain"
+# no max_age_secs: staleness not checked
+```
+
+The file is loaded by `RootsConfig::load(path)` and parsed into `Vec<WatchRoot>`.
+An example covering the Joe Yen daily roots ships at `config/roots.example.toml`.
+
+---
+
+## Core types
+
+All types are public and `serde`-(de)serializable. They form the extension
+surface for `anchor-probe`, `anchor-reconcile`, and `anchor-boot`.
+
+### `WatchRoot`
+
+One entry in the declared-roots manifest:
+
+```rust
+pub struct WatchRoot {
+    pub path: PathBuf,
+    pub max_age_secs: Option<u64>,
+}
+```
+
+### `WatchState`
+
+One live watchman root as seen through a `WatchBackend`:
+
+```rust
+pub struct WatchState {
+    pub path: PathBuf,
+    pub clock: Option<String>,  // watchman clock string, e.g. "c:1780493700:…"
+    pub present: bool,
+}
+```
+
+### `RootStatus`
+
+```rust
+pub enum RootStatus {
+    Watched,                   // live and clock is fresh (or no max_age_secs)
+    Missing,                   // declared but not in live set
+    Stale { age_secs: u64 },  // live but clock is older than max_age_secs
+    Undeclared,                // live but not in the manifest (informational only)
+}
+```
+
+### `ReconcileAction`
+
+```rust
+pub enum ReconcileAction {
+    Watch { path }             // re-assert with `watchman watch`
+    ReseedCursor { path }      // reset wchg cursor
+    NoOp { path }              // root is healthy
+    NoteUndeclared { path }    // record undeclared live root (never auto-removed)
+}
+```
+
+### `ReconcilePlan`
+
+```rust
+pub struct ReconcilePlan {
+    pub actions: Vec<ReconcileEntry>,  // declared first, undeclared live appended
+    pub summary: String,               // one-line human summary
+    pub missing_count: usize,          // count of Missing roots (drives exit code)
+}
+```
+
+`ReconcileEntry` pairs a `path`, `status`, and `action`.
+
+---
+
+## `WatchBackend` trait
+
+Abstracts the watchman socket so `reconcile()` is pure and testable, and so a
+backend swap (or watchman replacement) never touches the diff logic.
+
+```rust
+pub trait WatchBackend {
+    fn live_roots(&self) -> Result<Vec<WatchState>>;   // query current watch list
+    fn watch(&self, path: &Path) -> Result<()>;        // re-assert watch (apply layer)
+    fn reseed_cursor(&self, path: &Path) -> Result<()>;// reset cursor (apply layer)
+}
+```
+
+Two implementations ship:
+
+- **`WatchmanBackend`** — shells `watchman watch-list` / `watchman watch`.
+- **`FakeBackend { live: Vec<WatchState> }`** — in-memory, no subprocess. Use in tests.
+
+`anchor-probe`, `anchor-reconcile`, and `anchor-boot` extend this crate by
+implementing additional `WatchBackend` methods or wrapping the existing trait.
+
+---
+
+## Pure `reconcile` function
+
+```rust
+pub fn reconcile(
+    declared: &[WatchRoot],
+    live: &[WatchState],
+    now: i64,                  // Unix timestamp in seconds (injectable in tests)
+) -> ReconcilePlan
+```
+
+**Guarantees:**
+- Makes **zero** backend calls — accepts plain slices.
+- Deterministic given the same inputs.
+- Never removes or modifies state; all output is declarative.
+- Appends `Undeclared` entries for live roots not in `declared`; never triggers removal.
+
+---
+
+## SIGPIPE
+
+`main()` calls `sigpipe::reset()` as its first statement, so `anchor plan | head` never panics.
+
+---
+
+## MSRV
+
+Rust 1.85. No `let-chains`.
+
+## License
+
+MIT OR Apache-2.0

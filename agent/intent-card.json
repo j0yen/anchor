@@ -1,0 +1,125 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "prd_source": "/home/jsy/wintermute/autobuilder/PRD-anchor-roots.md",
+  "intent_slug": "anchor-roots",
+  "root_motivation": "There is no canonical record of which watchman roots should be watched; reboots silently drop the live set, leaving wchg returning empty with no diagnostic. A versioned declared-roots manifest and a pure reconcile function are the prerequisite for any tool that can restore, probe, or validate the watch set automatically.",
+  "user_persona": "Joe Yen, running wintermute tooling on an Arch Linux laptop, using wchg/recall daily. Wchg silently fails after every reboot until roots are manually re-watched. This is the foundational crate for the anchor fleet of tools.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing_count",
+    "lower_is_better": false,
+    "harness_command": "cargo test --workspace --no-fail-fast 2>&1 | grep -c 'test .* ok'",
+    "target": 8
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "cargo build and cargo test succeed offline; a test asserts reconcile makes zero backend calls (it operates only on the two passed slices + the injected now).",
+      "test": "tests/acceptance_ac1.rs::test_reconcile_no_backend_calls"
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "RootStatus, WatchRoot, WatchState, ReconcileAction, ReconcilePlan are public and serde-(de)serializable; a round-trip test covers each.",
+      "test": "tests/acceptance_ac2.rs::test_serde_roundtrip_all_types"
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "RootsConfig::load parses config/roots.example.toml; a test with a fixture manifest yields the expected Vec<WatchRoot>, including a per-root max_age_secs override.",
+      "test": "tests/acceptance_ac3.rs::test_roots_config_load_fixture"
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "reconcile classifies correctly against a FakeBackend snapshot: declared absent from live => Missing+Watch; watched with clock older than max_age_secs => Stale+ReseedCursor; live not in manifest => Undeclared+NoteUndeclared; fresh watched => Watched+NoOp.",
+      "test": "tests/acceptance_ac4.rs::test_reconcile_all_classifications"
+    },
+    {
+      "id": "AC5",
+      "level": "MUST",
+      "description": "anchor plan --format json emits one entry per declared root plus undeclared-live notes; the schema matches the documented ReconcilePlan.",
+      "test": "tests/acceptance_ac5.rs::test_plan_json_output_schema"
+    },
+    {
+      "id": "AC6",
+      "level": "MUST",
+      "description": "anchor plan exits non-zero when at least one declared root is Missing, zero when all are Watched/Stale only; covered by two integration cases driving a FakeBackend.",
+      "test": "tests/acceptance_ac6.rs::test_exit_code_missing_vs_ok"
+    },
+    {
+      "id": "AC7",
+      "level": "MUST",
+      "description": "anchor plan | head -1 does not panic (SIGPIPE reset verified by a test that closes the read end early).",
+      "test": "tests/acceptance_ac7.rs::test_sigpipe_no_panic"
+    },
+    {
+      "id": "AC8",
+      "level": "MUST",
+      "description": "README documents the manifest format, the type surface, and the WatchBackend trait so anchor-probe / anchor-reconcile / anchor-boot have a contract to extend.",
+      "test": "tests/acceptance_ac8.rs::test_readme_documents_contract"
+    }
+  ],
+  "scope": [
+    "Declare a TOML manifest of watch roots (~/.config/anchor/roots.toml)",
+    "RootsConfig::load parses the manifest into Vec<WatchRoot>",
+    "Core types: WatchRoot, WatchState, RootStatus, ReconcileAction, ReconcilePlan — all public and serde-serializable",
+    "WatchBackend trait abstracting watchman queries",
+    "WatchmanBackend (real, shells watchman) + FakeBackend (for tests)",
+    "Pure reconcile(declared, live, now) -> ReconcilePlan with no side effects",
+    "anchor plan subcommand: table output + --format json; exits nonzero on Missing roots",
+    "SIGPIPE reset in main() so anchor plan | head never panics",
+    "config/roots.example.toml shipping the Joe Yen daily roots"
+  ],
+  "non_goals": [
+    "No --apply: anchor-reconcile (a later PRD) owns the apply step",
+    "No daemon / watch loop: anchor is a one-shot CLI per invocation",
+    "No auto-creation of roots.toml: the user owns their manifest",
+    "No removal of Undeclared roots: the tool is informational only for live-but-undeclared roots",
+    "No cross-machine fleet sync: that is the constellation PRD family"
+  ],
+  "hard_constraints": {
+    "rust_edition": "2024",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 8,
+    "msrv": "1.85",
+    "additional": {
+      "no_let_chains": "MSRV 1.85 discipline — no let-chains syntax",
+      "sigpipe_reset": "sigpipe::reset() must be first line of main()"
+    }
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "Why do we need a declared-roots manifest?",
+      "a": "Because watchman drops watched roots on reboot, and there is no record of which roots should be watched."
+    },
+    {
+      "why": 2,
+      "q": "Why does losing the roots matter?",
+      "a": "Because wchg delta queries return silently empty or error without saying why, making the tool unreliable after every reboot."
+    },
+    {
+      "why": 3,
+      "q": "Why can't we just re-watch roots in the self-review script?",
+      "a": "We do — but the set being re-watched lives only in the script, not in a versioned manifest. Any change to the set requires editing scripts in multiple places."
+    },
+    {
+      "why": 4,
+      "q": "Why does the set need to be versioned?",
+      "a": "So the reconcile tool can diff declared-vs-live and emit a deterministic, testable plan rather than a procedural script that diverges from reality."
+    }
+  ],
+  "ambiguities_resolved": [
+    {
+      "question": "Should anchor plan call the real watchman binary or always use FakeBackend?",
+      "resolution": "Shipped with a real WatchmanBackend that shells watchman watch-list; tests use FakeBackend injected via the WatchBackend trait."
+    },
+    {
+      "question": "What is the unfakeable metric when the primary value is correctness of reconcile logic?",
+      "resolution": "acceptance_tests_passing_count — 8 ACs, all MUST. Build does not pass unless all 8 pass."
+    }
+  ],
+  "created_at": "2026-06-05T00:00:00Z"
+}
