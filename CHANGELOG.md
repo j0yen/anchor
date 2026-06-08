@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.0 — 2026-06-07
+
+Add `anchor probe` subcommand (PRD-anchor-probe). Reports watchman socket
+liveness and per-root health as structured JSON (`ProbeReport`) or a human
+table. Exit codes encode severity: 0=ok, 1=stale, 2=missing, 3=socket-down.
+Adds `Severity`, `RootHealth`, `ProbeReport` public types (serde); `ping()`
+method on `WatchBackend` with default `watchman version` impl; `FakeBackend`
+gains `socket_alive` field and `::new()`/`::dead()` constructors. 11
+integration tests in `tests/probe.rs` cover ACs 1–8.
+
+## v0.3.0 — 2026-06-06
+
+Add boot/ lifecycle hooks: anchor-reconcile.service (Type=oneshot boot unit), anchor-session-start.sh (SessionStart hook, exits 0 always), install.sh (idempotent; prints settings.json entry, does not write it). Fixes the watchman-drops-roots-on-reboot gap noted in the 2026-06-03 journal. ACs 1-4 verified offline; ACs 5-6 deferred to real reboot/session.
+
 ## v0.2.0 — 2026-06-06
 
 Add `anchor reconcile --apply`: executes the reconcile plan (Watch/ReseedCursor

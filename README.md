@@ -132,13 +132,14 @@ pub trait WatchBackend {
     fn live_roots(&self) -> Result<Vec<WatchState>>;   // query current watch list
     fn watch(&self, path: &Path) -> Result<()>;        // re-assert watch (apply layer)
     fn reseed_cursor(&self, path: &Path) -> Result<()>;// reset cursor (apply layer)
+    fn ping(&self) -> Result<bool>;                    // socket liveness (probe layer)
 }
 ```
 
 Two implementations ship:
 
-- **`WatchmanBackend`** — shells `watchman watch-list` / `watchman watch`.
-- **`FakeBackend { live: Vec<WatchState> }`** — in-memory, no subprocess. Use in tests.
+- **`WatchmanBackend`** — shells `watchman watch-list` / `watchman watch` / `watchman version`.
+- **`FakeBackend::new(live)`** / **`FakeBackend::dead()`** — in-memory, no subprocess. Use in tests.
 
 `anchor-probe`, `anchor-reconcile`, and `anchor-boot` extend this crate by
 implementing additional `WatchBackend` methods or wrapping the existing trait.
@@ -218,9 +219,78 @@ block a session from starting.
 
 ---
 
+## `anchor probe` — health check
+
+`anchor probe` reports watchman socket liveness and per-root health with a
+structured exit code so a hook can branch on watch health without parsing
+human output.
+
+```
+anchor probe                   # human table (default)
+anchor probe --format json     # machine-readable ProbeReport
+```
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All roots watched and fresh; socket alive |
+| `1` | At least one root has a stale clock |
+| `2` | At least one root is missing from the live watchman set |
+| `3` | Watchman socket is unreachable (root health checks skipped) |
+
+The highest severity wins when multiple roots have different statuses.
+
+### JSON schema (`ProbeReport`)
+
+```json
+{
+  "socket_alive": true,
+  "worst": "missing",
+  "checked_at": 1749344410,
+  "roots": [
+    {
+      "path": "/home/jsy/.claude",
+      "status": { "status": "missing" },
+      "clock": null,
+      "age_secs": null
+    }
+  ]
+}
+```
+
+`worst` values: `"ok"`, `"stale"`, `"missing"`, `"socket_down"`.
+
+### SessionStart hook usage
+
+Gate Claude session startup on watch health by adding to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchor probe --format json > /tmp/anchor-probe.json 2>&1; code=$?; if [ $code -ge 2 ]; then echo 'anchor: watch health degraded (exit '$code') — run anchor reconcile --apply'; fi; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This silently passes on `0`/`1` (ok/stale); prints a warning on `2` (missing)
+or `3` (socket down); always exits 0 so a probe failure never blocks session start.
+
+---
+
 ## SIGPIPE
 
-`main()` calls `sigpipe::reset()` as its first statement, so `anchor plan | head` never panics.
+`main()` calls `sigpipe::reset()` as its first statement, so `anchor plan | head` and `anchor probe | head -1` never panic.
 
 ---
 

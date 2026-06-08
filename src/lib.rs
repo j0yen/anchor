@@ -205,6 +205,9 @@ pub struct ReconcilePlan {
 ///
 /// The `watch` and `reseed_cursor` methods are defined here so `anchor-reconcile`
 /// (the apply PRD) can reuse the trait; `anchor plan` never calls them.
+///
+/// `ping` is used exclusively by `anchor probe`; the default implementation
+/// shells `watchman version` and treats any success as socket-alive.
 pub trait WatchBackend {
     /// Return the list of roots currently tracked by the backend.
     ///
@@ -230,6 +233,26 @@ pub trait WatchBackend {
     ///
     /// Returns an [`Error`] if the reseed command fails.
     fn reseed_cursor(&self, path: &Path) -> Result<()>;
+
+    /// Check whether the watchman socket is reachable.
+    ///
+    /// Returns `Ok(true)` if watchman responds, `Ok(false)` if it is
+    /// unreachable (socket gone, process not running), or an [`Error`] if the
+    /// subprocess could not be spawned at all.
+    ///
+    /// The default implementation shells `watchman version` and maps a
+    /// non-zero exit to `Ok(false)`. Override in tests via [`FakeBackend`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the subprocess cannot be launched.
+    fn ping(&self) -> Result<bool> {
+        let out = std::process::Command::new("watchman")
+            .args(["version"])
+            .output()
+            .map_err(|e| Error::Watchman(format!("exec watchman version: {e}")))?;
+        Ok(out.status.success())
+    }
 }
 
 // ─── WatchmanBackend ──────────────────────────────────────────────────────────
@@ -300,6 +323,22 @@ impl WatchBackend for WatchmanBackend {
 pub struct FakeBackend {
     /// The snapshot of live roots returned by [`WatchBackend::live_roots`].
     pub live: Vec<WatchState>,
+    /// The value returned by [`WatchBackend::ping`]. Defaults to `true`.
+    pub socket_alive: bool,
+}
+
+impl FakeBackend {
+    /// Construct a new `FakeBackend` with a live socket and the given roots.
+    #[must_use]
+    pub fn new(live: Vec<WatchState>) -> Self {
+        Self { live, socket_alive: true }
+    }
+
+    /// Construct a `FakeBackend` with the socket down.
+    #[must_use]
+    pub fn dead() -> Self {
+        Self { live: vec![], socket_alive: false }
+    }
 }
 
 impl WatchBackend for FakeBackend {
@@ -313,6 +352,10 @@ impl WatchBackend for FakeBackend {
 
     fn reseed_cursor(&self, _path: &Path) -> Result<()> {
         Ok(())
+    }
+
+    fn ping(&self) -> Result<bool> {
+        Ok(self.socket_alive)
     }
 }
 
@@ -332,17 +375,20 @@ pub struct TrackingFakeBackend {
     pub reseeded_calls: std::cell::RefCell<Vec<PathBuf>>,
     /// If set, `watch` returns an error for this path (simulates failure).
     pub fail_watch_path: Option<PathBuf>,
+    /// The value returned by [`WatchBackend::ping`].
+    pub socket_alive: bool,
 }
 
 impl TrackingFakeBackend {
     /// Construct a new `TrackingFakeBackend` with the given initial live roots.
     #[must_use]
-    pub const fn new(live: Vec<WatchState>) -> Self {
+    pub fn new(live: Vec<WatchState>) -> Self {
         Self {
             live: std::cell::RefCell::new(live),
             watched_calls: std::cell::RefCell::new(Vec::new()),
             reseeded_calls: std::cell::RefCell::new(Vec::new()),
             fail_watch_path: None,
+            socket_alive: true,
         }
     }
 }
@@ -379,6 +425,10 @@ impl WatchBackend for TrackingFakeBackend {
             }
         }
         Ok(())
+    }
+
+    fn ping(&self) -> Result<bool> {
+        Ok(self.socket_alive)
     }
 }
 
@@ -443,6 +493,125 @@ pub fn apply(plan: &ReconcilePlan, backend: &dyn WatchBackend) -> ApplyReport {
     }
 
     ApplyReport { attempted, succeeded, failed }
+}
+
+// ─── Probe ────────────────────────────────────────────────────────────────────
+
+/// Overall severity returned by [`probe`].
+///
+/// Ordered so the highest-severity variant maps to the highest exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// All roots watched and fresh; socket alive.
+    Ok,
+    /// At least one root has a stale clock; socket alive.
+    Stale,
+    /// At least one root is missing from the watchman set; socket alive.
+    Missing,
+    /// Watchman socket is unreachable (all root health is meaningless).
+    SocketDown,
+}
+
+/// Health of a single declared root as computed by [`probe`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootHealth {
+    /// Declared root path.
+    pub path: PathBuf,
+    /// Classification result.
+    pub status: RootStatus,
+    /// Watchman clock string, if known.
+    pub clock: Option<String>,
+    /// Age of the clock vs the injected `now`, in seconds. `None` when there
+    /// is no clock or no `max_age_secs` configured for this root.
+    pub age_secs: Option<u64>,
+}
+
+/// The output of [`probe`].
+///
+/// `socket_alive: false` means every field in `roots` is meaningless —
+/// the watchman daemon is gone and all further reads would be empty/error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeReport {
+    /// Whether the watchman socket responded to a `ping`.
+    pub socket_alive: bool,
+    /// Per-root health entries (empty when `socket_alive` is false).
+    pub roots: Vec<RootHealth>,
+    /// Highest severity across all entries (or `SocketDown` when !socket_alive).
+    pub worst: Severity,
+    /// Unix timestamp (seconds) at which the probe ran — injected by caller.
+    pub checked_at: i64,
+}
+
+/// Pure-read health check.
+///
+/// Calls `backend.ping()` first; if the socket is down returns a
+/// `SocketDown` report immediately without querying any roots.
+///
+/// Otherwise calls `backend.live_roots()` and classifies each declared root
+/// against the live snapshot using the same staleness logic as [`reconcile`],
+/// driven by each root's `max_age_secs` and the injected `now`.
+///
+/// # Contract
+///
+/// This function NEVER calls `backend.watch()` or `backend.reseed_cursor()`.
+/// Those are `apply`-layer operations. Tests assert this via a tracking backend
+/// that records every method call.
+///
+/// # Errors
+///
+/// Returns an [`Error`] if `backend.ping()` or `backend.live_roots()` fails.
+pub fn probe(
+    declared: &[WatchRoot],
+    backend: &dyn WatchBackend,
+    now: i64,
+) -> Result<ProbeReport> {
+    let socket_alive = backend.ping()?;
+    if !socket_alive {
+        return Ok(ProbeReport {
+            socket_alive: false,
+            roots: vec![],
+            worst: Severity::SocketDown,
+            checked_at: now,
+        });
+    }
+
+    let live = backend.live_roots()?;
+    let live_index: std::collections::HashMap<&Path, &WatchState> =
+        live.iter().map(|s| (s.path.as_path(), s)).collect();
+
+    let mut worst = Severity::Ok;
+    let mut roots = Vec::with_capacity(declared.len());
+
+    for decl in declared {
+        let (status, clock, age_secs) = if let Some(state) = live_index.get(decl.path.as_path()) {
+            if state.present {
+                let st = classify_staleness(decl, state, now);
+                let age = match &st {
+                    RootStatus::Stale { age_secs } => Some(*age_secs),
+                    _ => None,
+                };
+                (st, state.clock.clone(), age)
+            } else {
+                (RootStatus::Missing, None, None)
+            }
+        } else {
+            (RootStatus::Missing, None, None)
+        };
+
+        let sev = match &status {
+            RootStatus::Watched | RootStatus::Undeclared => Severity::Ok,
+            RootStatus::Stale { .. } => Severity::Stale,
+            RootStatus::Missing => Severity::Missing,
+        };
+        if sev > worst {
+            worst = sev;
+        }
+
+        roots.push(RootHealth { path: decl.path.clone(), status, clock, age_secs });
+    }
+
+    Ok(ProbeReport { socket_alive: true, roots, worst, checked_at: now })
 }
 
 // ─── Pure reconcile ───────────────────────────────────────────────────────────

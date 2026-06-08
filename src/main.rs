@@ -14,8 +14,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use anchor::{
-    ApplyReport, Error, FakeBackend, RootsConfig, WatchBackend, WatchState, WatchmanBackend,
-    apply, reconcile,
+    ApplyReport, Error, FakeBackend, ProbeReport, RootsConfig, Severity, WatchBackend, WatchState,
+    WatchmanBackend, apply, probe, reconcile,
 };
 
 /// Declare which watch roots should be live, then diff against reality.
@@ -36,6 +36,30 @@ enum Cmd {
     /// With --apply: executes `Watch` and `ReseedCursor` actions; never removes roots.
     ///   Safe to run repeatedly — idempotent on the second pass.
     Reconcile(ReconcileArgs),
+    /// Check watchman socket liveness and root health; exits non-zero on any problem.
+    ///
+    /// Exit codes: 0 = all ok, 1 = any stale, 2 = any missing, 3 = socket down.
+    /// Use --format json for machine-readable ProbeReport.
+    Probe(ProbeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ProbeArgs {
+    /// Path to the roots manifest (default: ~/.config/anchor/roots.toml).
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
+    /// Output format.
+    #[arg(long, default_value = "table")]
+    format: OutputFormat,
+
+    /// Use a fake backend instead of real watchman (for CI/testing).
+    #[arg(long, hide = true)]
+    fake_backend: bool,
+
+    /// When using --fake-backend, simulate the socket being down.
+    #[arg(long, hide = true)]
+    fake_socket_down: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -102,7 +126,7 @@ fn run() -> Result<ExitCode, Error> {
             let cfg = RootsConfig::load(&manifest_path)?;
 
             let live: Vec<WatchState> = if args.fake_backend {
-                FakeBackend { live: vec![] }.live_roots()?
+                FakeBackend::new(vec![]).live_roots()?
             } else {
                 WatchmanBackend.live_roots()?
             };
@@ -131,6 +155,42 @@ fn run() -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
 
+        Cmd::Probe(args) => {
+            let manifest_path = args.manifest.unwrap_or_else(default_manifest_path);
+            let cfg = RootsConfig::load(&manifest_path)?;
+
+            let backend: Box<dyn WatchBackend> = if args.fake_backend {
+                if args.fake_socket_down {
+                    Box::new(FakeBackend::dead())
+                } else {
+                    Box::new(FakeBackend::new(vec![]))
+                }
+            } else {
+                Box::new(WatchmanBackend)
+            };
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(duration_secs_to_i64)
+                .unwrap_or(0);
+
+            let report = probe(&cfg.roots, backend.as_ref(), now)?;
+
+            match args.format {
+                OutputFormat::Json => {
+                    let json = serde_json::to_string_pretty(&report)
+                        .map_err(|e| Error::Watchman(format!("json serialize: {e}")))?;
+                    println!("{json}");
+                }
+                OutputFormat::Table => {
+                    print_probe_report(&report);
+                }
+            }
+
+            let exit_code = severity_exit(&report.worst);
+            return Ok(exit_code);
+        }
+
         Cmd::Reconcile(args) => {
             let manifest_path = args.manifest.unwrap_or_else(default_manifest_path);
             let cfg = RootsConfig::load(&manifest_path)?;
@@ -138,7 +198,7 @@ fn run() -> Result<ExitCode, Error> {
             // Select backend: fake (CI) or real watchman.
             // Box<dyn WatchBackend> lets us hold either without generics in run().
             let backend: Box<dyn WatchBackend> = if args.fake_backend {
-                Box::new(FakeBackend { live: vec![] })
+                Box::new(FakeBackend::new(vec![]))
             } else {
                 Box::new(WatchmanBackend)
             };
@@ -299,6 +359,73 @@ fn print_apply_report(report: &ApplyReport) {
         report.succeeded.len(),
         report.attempted.len()
     );
+}
+
+/// Map a [`Severity`] to its documented exit code.
+fn severity_exit(sev: &Severity) -> ExitCode {
+    match sev {
+        Severity::Ok => ExitCode::SUCCESS,
+        Severity::Stale => ExitCode::from(1u8),
+        Severity::Missing => ExitCode::from(2u8),
+        Severity::SocketDown => ExitCode::from(3u8),
+    }
+}
+
+fn print_probe_report(report: &ProbeReport) {
+    use tabled::{Table, Tabled, settings::Style};
+
+    #[derive(Tabled)]
+    struct Row {
+        #[tabled(rename = "Root")]
+        root: String,
+        #[tabled(rename = "Status")]
+        status: String,
+        #[tabled(rename = "Age (s)")]
+        age: String,
+        #[tabled(rename = "Clock")]
+        clock: String,
+    }
+
+    if !report.socket_alive {
+        println!("watchman socket DOWN — all root health checks skipped");
+        println!("worst: SocketDown  exit: 3");
+        return;
+    }
+
+    let rows: Vec<Row> = report
+        .roots
+        .iter()
+        .map(|h| Row {
+            root: h.path.display().to_string(),
+            status: probe_status_str(&h.status),
+            age: h.age_secs.map_or_else(|| "-".to_owned(), |a| a.to_string()),
+            clock: h.clock.clone().unwrap_or_else(|| "-".to_owned()),
+        })
+        .collect();
+
+    if rows.is_empty() {
+        println!("no declared roots");
+    } else {
+        let table = Table::new(rows).with(Style::modern()).to_string();
+        println!("{table}");
+    }
+
+    let worst_str = match report.worst {
+        Severity::Ok => "Ok",
+        Severity::Stale => "Stale",
+        Severity::Missing => "Missing",
+        Severity::SocketDown => "SocketDown",
+    };
+    println!("worst: {worst_str}  checked_at: {}", report.checked_at);
+}
+
+fn probe_status_str(status: &anchor::RootStatus) -> String {
+    match status {
+        anchor::RootStatus::Watched => "watched".to_owned(),
+        anchor::RootStatus::Missing => "MISSING".to_owned(),
+        anchor::RootStatus::Stale { age_secs } => format!("stale({age_secs}s)"),
+        anchor::RootStatus::Undeclared => "undeclared".to_owned(),
+    }
 }
 
 fn main() -> ExitCode {

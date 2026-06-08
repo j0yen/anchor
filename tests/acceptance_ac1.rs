@@ -35,13 +35,11 @@ fn test_reconcile_no_backend_calls() {
 /// separately, then pass the result to reconcile.
 #[test]
 fn test_reconcile_separation_from_backend() {
-    let backend = FakeBackend {
-        live: vec![WatchState {
-            path: PathBuf::from("/tmp/test"),
-            clock: None,
-            present: true,
-        }],
-    };
+    let backend = FakeBackend::new(vec![WatchState {
+        path: PathBuf::from("/tmp/test"),
+        clock: None,
+        present: true,
+    }]);
 
     // Step 1: query the backend (one call only, outside reconcile).
     let live = backend.live_roots().expect("FakeBackend::live_roots should not fail");
