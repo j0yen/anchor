@@ -1,29 +1,26 @@
 # anchor
 
-**Declared watch-root manifest and pure reconcile plan for watchman root management.**
+A declared manifest of which watchman roots should be live, and a pure function that diffs declared against live to produce a reconcile plan.
 
-`anchor` solves a recurring problem on a watchman-backed laptop: every reboot
-(or socket bounce) silently drops all watched roots, leaving `wchg` returning
-empty deltas with no diagnostic. There is no canonical record of which roots
-*should* be watched, and no tool that diffs declared-vs-live.
+## Why it exists
 
-`anchor` is the base crate that creates that record and the shared types. The
-rest of the anchor fleet extends it:
+A watchman-backed laptop loses state quietly. Every reboot — or socket bounce — drops the watched roots, and `wchg` then returns empty deltas with no error to tell you why. Nothing watches the watcher: there is no canonical record of which roots *should* be live, and nothing that compares that record to reality.
 
-| PRD | What it adds |
-|---|---|
-| `anchor-probe` | real-time cursor-age probing via watchman clock |
-| `anchor-reconcile` | `--apply` mode that calls `watchman watch` / reseeds cursors |
-| `anchor-boot` | systemd service that re-watches roots on every reboot |
+`anchor` is that record. You declare the roots in a TOML file; `anchor` reads the live watchman set and reports the difference. The diff is computed by a pure function — no backend calls, deterministic given its inputs — so the part that decides what to do is fully testable, and the part that touches watchman is a thin, swappable layer around it.
 
----
+This crate is the base of a small fleet. `anchor-probe` adds cursor-age probing, `anchor-reconcile` adds the `--apply` path that re-asserts dropped roots, and `anchor-boot` wires reconcile into the laptop's lifecycle. All three extend the types and the `WatchBackend` trait defined here.
+
+## Install
+
+```
+cargo install --path .
+```
+
+MSRV is Rust 1.85 (edition 2024, no `let-chains`).
 
 ## Quick start
 
 ```
-# Install
-cargo install --path .
-
 # Create your manifest
 mkdir -p ~/.config/anchor
 cp config/roots.example.toml ~/.config/anchor/roots.toml
@@ -34,15 +31,12 @@ anchor plan
 anchor plan --format json
 ```
 
-`anchor plan` exits **non-zero** if any declared root is `Missing` — safe to
-use as a pre-command gate.
-
----
+`anchor plan` exits non-zero if any declared root is `Missing`, so it works as a pre-command gate. An example manifest covering the daily roots ships at `config/roots.example.toml`.
 
 ## Manifest format (`roots.toml`)
 
 ```toml
-# Each [[root]] entry declares one watchman root that should always be live.
+# Each [[root]] declares one watchman root that should always be live.
 
 [[root]]
 path = "/home/jsy/.claude"
@@ -53,79 +47,42 @@ path = "/home/jsy/brain"
 # no max_age_secs: staleness not checked
 ```
 
-The file is loaded by `RootsConfig::load(path)` and parsed into `Vec<WatchRoot>`.
-An example covering the Joe Yen daily roots ships at `config/roots.example.toml`.
+The file is loaded by `RootsConfig::load(path)` into `Vec<WatchRoot>`.
 
----
+## Commands
 
-## Core types
+| Command | What it does |
+|---|---|
+| `anchor plan` | diff declared roots against live watchman; print the reconcile plan |
+| `anchor probe` | report socket liveness and per-root health with a severity exit code |
+| `anchor reconcile` | the reconcile plan plus an `--apply` path that re-asserts dropped roots |
 
-All types are public and `serde`-(de)serializable. They form the extension
-surface for `anchor-probe`, `anchor-reconcile`, and `anchor-boot`.
+Both `plan` and `probe` take `--format json` for machine-readable output.
 
-### `WatchRoot`
+### `anchor probe` exit codes
 
-One entry in the declared-roots manifest:
+The probe reports health through its exit code so a hook can branch on watch health without parsing human output. Highest severity wins.
 
-```rust
-pub struct WatchRoot {
-    pub path: PathBuf,
-    pub max_age_secs: Option<u64>,
-}
-```
+| Code | Meaning |
+|------|---------|
+| `0` | all roots watched and fresh; socket alive |
+| `1` | at least one root has a stale clock |
+| `2` | at least one root is missing from the live set |
+| `3` | watchman socket unreachable (root checks skipped) |
 
-### `WatchState`
+JSON output is a `ProbeReport`; the top-level `worst` field is one of `"ok"`, `"stale"`, `"missing"`, `"socket_down"`.
 
-One live watchman root as seen through a `WatchBackend`:
+## How it works
 
-```rust
-pub struct WatchState {
-    pub path: PathBuf,
-    pub clock: Option<String>,  // watchman clock string, e.g. "c:1780493700:…"
-    pub present: bool,
-}
-```
-
-### `RootStatus`
+The core is one function:
 
 ```rust
-pub enum RootStatus {
-    Watched,                   // live and clock is fresh (or no max_age_secs)
-    Missing,                   // declared but not in live set
-    Stale { age_secs: u64 },  // live but clock is older than max_age_secs
-    Undeclared,                // live but not in the manifest (informational only)
-}
+pub fn reconcile(declared: &[WatchRoot], live: &[WatchState], now: i64) -> ReconcilePlan
 ```
 
-### `ReconcileAction`
+It makes zero backend calls, is deterministic given its inputs, and never removes or modifies state — every output is declarative. Live roots not in the manifest are appended as `Undeclared` and noted, never auto-removed.
 
-```rust
-pub enum ReconcileAction {
-    Watch { path }             // re-assert with `watchman watch`
-    ReseedCursor { path }      // reset wchg cursor
-    NoOp { path }              // root is healthy
-    NoteUndeclared { path }    // record undeclared live root (never auto-removed)
-}
-```
-
-### `ReconcilePlan`
-
-```rust
-pub struct ReconcilePlan {
-    pub actions: Vec<ReconcileEntry>,  // declared first, undeclared live appended
-    pub summary: String,               // one-line human summary
-    pub missing_count: usize,          // count of Missing roots (drives exit code)
-}
-```
-
-`ReconcileEntry` pairs a `path`, `status`, and `action`.
-
----
-
-## `WatchBackend` trait
-
-Abstracts the watchman socket so `reconcile()` is pure and testable, and so a
-backend swap (or watchman replacement) never touches the diff logic.
+The watchman socket sits behind a trait, so the diff logic never touches a subprocess and a backend swap never touches the diff:
 
 ```rust
 pub trait WatchBackend {
@@ -136,134 +93,47 @@ pub trait WatchBackend {
 }
 ```
 
-Two implementations ship:
+`WatchmanBackend` shells out to `watchman`; `FakeBackend` is in-memory for tests. The downstream crates extend the fleet by implementing more of this trait or wrapping it.
 
-- **`WatchmanBackend`** — shells `watchman watch-list` / `watchman watch` / `watchman version`.
-- **`FakeBackend::new(live)`** / **`FakeBackend::dead()`** — in-memory, no subprocess. Use in tests.
+### Core types
 
-`anchor-probe`, `anchor-reconcile`, and `anchor-boot` extend this crate by
-implementing additional `WatchBackend` methods or wrapping the existing trait.
+All are public and `serde`-(de)serializable — they are the extension surface for the rest of the fleet.
 
----
-
-## Pure `reconcile` function
-
-```rust
-pub fn reconcile(
-    declared: &[WatchRoot],
-    live: &[WatchState],
-    now: i64,                  // Unix timestamp in seconds (injectable in tests)
-) -> ReconcilePlan
-```
-
-**Guarantees:**
-- Makes **zero** backend calls — accepts plain slices.
-- Deterministic given the same inputs.
-- Never removes or modifies state; all output is declarative.
-- Appends `Undeclared` entries for live roots not in `declared`; never triggers removal.
-
----
+- `WatchRoot` — one declared entry: a `path` and optional `max_age_secs`.
+- `WatchState` — one live root as seen through a backend: `path`, optional watchman `clock`, `present`.
+- `RootStatus` — `Watched` / `Missing` / `Stale { age_secs }` / `Undeclared`.
+- `ReconcileAction` — `Watch` / `ReseedCursor` / `NoOp` / `NoteUndeclared`, each carrying a `path`.
+- `ReconcileEntry` — pairs a `path`, `status`, and `action`.
+- `ReconcilePlan` — the `actions`, a one-line `summary`, and `missing_count` (which drives the exit code).
 
 ## anchor-boot: lifecycle wiring
 
-`anchor-boot` ships the `boot/` directory that wires `anchor reconcile --apply`
-into the laptop's lifecycle so watch roots are restored automatically on every
-reboot and every new Claude session — without any manual re-watch step.
-
-### Coverage split
+`anchor-boot` ships the `boot/` directory, which wires `anchor reconcile --apply` into the laptop's lifecycle so roots are restored without a manual re-watch. Two loss windows, two mechanisms:
 
 | Loss window | Mechanism |
 |---|---|
-| Reboot / watchman restart | `anchor-reconcile.service` — Type=oneshot, ordered After=watchman.service |
-| New Claude session (mid-session loss) | `anchor-session-start.sh` SessionStart hook |
-
-### Install
+| reboot / watchman restart | `anchor-reconcile.service` — `Type=oneshot`, ordered `After=watchman.service` |
+| new Claude session (mid-session loss) | `anchor-session-start.sh` SessionStart hook |
 
 ```bash
-# From the anchor repo root:
 bash boot/install.sh
 ```
 
-`install.sh` is idempotent: running it twice leaves exactly one unit symlink and
-exits 0. It:
+`install.sh` is idempotent — run it twice and you get exactly one unit symlink and exit 0. It symlinks the service into `~/.config/systemd/user/`, runs `daemon-reload && enable`, and prints the SessionStart hook line to add. It does not edit `~/.claude/settings.json`; that edit is user-gated.
 
-1. Symlinks `boot/anchor-reconcile.service` into `~/.config/systemd/user/`
-2. Runs `systemctl --user daemon-reload && enable`
-3. **Prints** the `settings.json` SessionStart hook entry to add (it does NOT
-   modify `~/.claude/settings.json` unprompted — that edit is user-gated)
-
-### Back out
+To back out:
 
 ```bash
 systemctl --user disable --now anchor-reconcile.service
 rm ~/.config/systemd/user/anchor-reconcile.service
-# Remove the SessionStart hook line from ~/.claude/settings.json by hand.
+# then remove the SessionStart hook line from ~/.claude/settings.json by hand
 ```
 
-### Optional periodic timer
+`boot/anchor-reconcile.timer` ships but is not enabled by default — the oneshot plus the SessionStart hook already cover both observed loss windows. Enable it with `systemctl --user enable --now anchor-reconcile.timer` if you want a periodic check.
 
-`boot/anchor-reconcile.timer` is provided but **not enabled by default**
-(the oneshot + SessionStart hook already cover both observed loss windows).
-Enable with:
-
-```bash
-systemctl --user enable --now anchor-reconcile.timer
-```
-
-### Session-start hook behaviour
-
-`boot/anchor-session-start.sh` follows the low-noise posture of the existing
-hooks: it prints a one-line summary **only if a root was re-asserted**. A
-healthy session stays silent. It always exits 0 — a watch failure must never
-block a session from starting.
-
----
-
-## `anchor probe` — health check
-
-`anchor probe` reports watchman socket liveness and per-root health with a
-structured exit code so a hook can branch on watch health without parsing
-human output.
-
-```
-anchor probe                   # human table (default)
-anchor probe --format json     # machine-readable ProbeReport
-```
-
-### Exit codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | All roots watched and fresh; socket alive |
-| `1` | At least one root has a stale clock |
-| `2` | At least one root is missing from the live watchman set |
-| `3` | Watchman socket is unreachable (root health checks skipped) |
-
-The highest severity wins when multiple roots have different statuses.
-
-### JSON schema (`ProbeReport`)
-
-```json
-{
-  "socket_alive": true,
-  "worst": "missing",
-  "checked_at": 1749344410,
-  "roots": [
-    {
-      "path": "/home/jsy/.claude",
-      "status": { "status": "missing" },
-      "clock": null,
-      "age_secs": null
-    }
-  ]
-}
-```
-
-`worst` values: `"ok"`, `"stale"`, `"missing"`, `"socket_down"`.
+The session-start hook stays quiet: it prints one line only if a root was re-asserted, and always exits 0, so a watch failure never blocks a session from starting.
 
 ### SessionStart hook usage
-
-Gate Claude session startup on watch health by adding to `~/.claude/settings.json`:
 
 ```json
 {
@@ -283,20 +153,11 @@ Gate Claude session startup on watch health by adding to `~/.claude/settings.jso
 }
 ```
 
-This silently passes on `0`/`1` (ok/stale); prints a warning on `2` (missing)
-or `3` (socket down); always exits 0 so a probe failure never blocks session start.
-
----
+Passes silently on `0`/`1`, warns on `2`/`3`, always exits 0.
 
 ## SIGPIPE
 
-`main()` calls `sigpipe::reset()` as its first statement, so `anchor plan | head` and `anchor probe | head -1` never panic.
-
----
-
-## MSRV
-
-Rust 1.85. No `let-chains`.
+`main()` calls `sigpipe::reset()` first thing, so `anchor plan | head` and `anchor probe | head -1` never panic.
 
 ## License
 
